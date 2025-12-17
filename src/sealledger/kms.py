@@ -2,6 +2,12 @@ import os
 from typing import Tuple
 from .crypto import generate_ed25519_keypair, sign, verify, sha256_hex
 
+try:
+    from google.cloud import kms_v1  # type: ignore
+    from google.protobuf import duration_pb2  # noqa: F401
+except Exception:  # pragma: no cover - optional dep
+    kms_v1 = None
+
 
 class KMSInterface:
     def generate_keypair(self) -> Tuple[bytes, bytes]:
@@ -71,3 +77,53 @@ class AWSKMS(KMSInterface):
         kid = key_ref.decode() if isinstance(key_ref, (bytes, bytearray)) else self.key_id
         resp = self.client.verify(KeyId=kid, Message=message, Signature=signature, MessageType="RAW", SigningAlgorithm="ECDSA_SHA_256")
         return bool(resp.get("SignatureValid", False))
+
+
+class GCPKMS(KMSInterface):
+    """GCP KMS adapter using google-cloud-kms.
+
+    Notes:
+    - Assumes an asymmetric signing key is created in KMS and the key resource
+      name (projects/.../keyRings/.../cryptoKeys/.../cryptoKeyVersions/...) is provided.
+    - `sign` calls `asymmetric_sign` and returns raw signature bytes.
+    - `verify` fetches the public key via `get_public_key` and verifies locally.
+    """
+
+    def __init__(self, key_name: str):
+        if kms_v1 is None:
+            raise RuntimeError("google-cloud-kms is not installed")
+        self.key_name = key_name
+        # Allow overriding endpoint for emulator via GCP_KMS_ENDPOINT
+        endpoint = os.getenv("GCP_KMS_ENDPOINT")
+        if endpoint:
+            client_options = {"api_endpoint": endpoint}
+            self.client = kms_v1.KeyManagementServiceClient(client_options=client_options)
+        else:
+            self.client = kms_v1.KeyManagementServiceClient()
+
+    def generate_keypair(self) -> Tuple[bytes, bytes]:
+        # Can't export private key; return key resource name (as bytes) as a reference
+        return (self.key_name.encode(), b"")
+
+    def sign(self, key_ref: bytes | None, message: bytes) -> bytes:
+        name = key_ref.decode() if isinstance(key_ref, (bytes, bytearray)) else self.key_name
+        request = {"name": name, "digest": {"sha256": __import__("hashlib").sha256(message).digest()}}
+        resp = self.client.asymmetric_sign(request=request)
+        return resp.signature
+
+    def verify(self, key_ref: bytes | None, message: bytes, signature: bytes) -> bool:
+        # Fetch public key and verify locally using cryptography
+        name = key_ref.decode() if isinstance(key_ref, (bytes, bytearray)) else self.key_name
+        resp = self.client.get_public_key(request={"name": name})
+        pem = resp.pem
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+
+        try:
+            pub = load_pem_public_key(pem.encode())
+            digest = __import__("hashlib").sha256(message).digest()
+            pub.verify(signature, digest, ec.ECDSA(hashes.SHA256()))
+            return True
+        except Exception:
+            return False
